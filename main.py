@@ -52,6 +52,7 @@ def create_video_from_image(input_path: str, output_path: str, duration: int = 5
 
 
 @app.get("/")
+@app.head("/")
 async def root():
     return {
         "message": "Foto Verlenger API - Maak een video van je foto",
@@ -132,6 +133,7 @@ async def extend_photo(
 
 
 @app.get("/health")
+@app.head("/health")
 async def health_check():
     """Health check endpoint voor Render"""
     # Check of FFmpeg beschikbaar is
