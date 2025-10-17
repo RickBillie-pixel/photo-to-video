@@ -1,5 +1,5 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import os
@@ -7,8 +7,24 @@ import uuid
 from pathlib import Path
 import tempfile
 import shutil
+import logging
+from datetime import datetime
+from PIL import Image
+import json
+from enum import Enum
+from typing import Optional
 
-app = FastAPI(title="Foto Verlenger API")
+# Logging configuratie
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Foto Verlenger API - Async 4K")
 
 # CORS middleware
 app.add_middleware(
@@ -22,133 +38,488 @@ app.add_middleware(
 # Directories
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "uploads"
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "outputs"
+JOBS_DIR = Path(tempfile.gettempdir()) / "jobs"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+JOBS_DIR.mkdir(exist_ok=True)
+
+logger.info("=" * 80)
+logger.info("🚀 FOTO VERLENGER API - ASYNC 4K - GESTART")
+logger.info("=" * 80)
+logger.info(f"📁 Upload directory: {UPLOAD_DIR}")
+logger.info(f"📁 Output directory: {OUTPUT_DIR}")
+logger.info(f"📁 Jobs directory: {JOBS_DIR}")
+logger.info(f"💰 Render Plan: Pro ($25/maand)")
+logger.info("=" * 80)
 
 
-def create_video_from_image(input_path: str, output_path: str, duration: int = 5, fps: int = 30, width: int = 1920, height: int = 1080):
-    """
-    Creëert een video van een statische foto voor een bepaalde duur
-    """
-    cmd = [
-        'ffmpeg',
-        '-loop', '1',  # Loop de input afbeelding
-        '-i', input_path,  # Input afbeelding
-        '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2',  # Schaal en centreer
-        '-c:v', 'libx264',  # Video codec
-        '-t', str(duration),  # Duur in seconden
-        '-pix_fmt', 'yuv420p',  # Pixel format voor compatibiliteit
-        '-r', str(fps),  # Frame rate
-        '-y',  # Overschrijf output bestand
-        output_path
-    ]
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+def get_job_info(job_id: str) -> Optional[dict]:
+    """Haal job informatie op"""
+    job_file = JOBS_DIR / f"{job_id}.json"
+    if not job_file.exists():
+        return None
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error: {e.stderr}")
-        raise HTTPException(status_code=500, detail=f"Video conversie mislukt: {e.stderr}")
+        with open(job_file, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"❌ Kan job info niet lezen: {e}")
+        return None
+
+
+def update_job_status(job_id: str, status: JobStatus, **kwargs):
+    """Update job status"""
+    job_file = JOBS_DIR / f"{job_id}.json"
+    
+    if job_file.exists():
+        with open(job_file, 'r') as f:
+            job_info = json.load(f)
+    else:
+        job_info = {"job_id": job_id, "created_at": datetime.now().isoformat()}
+    
+    job_info["status"] = status
+    job_info["updated_at"] = datetime.now().isoformat()
+    job_info.update(kwargs)
+    
+    with open(job_file, 'w') as f:
+        json.dump(job_info, f, indent=2)
+    
+    logger.info(f"📝 Job {job_id[:8]} status: {status}")
+
+
+def get_image_dimensions(image_path: str):
+    """Haal de originele afmetingen van de afbeelding op"""
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+            logger.info(f"📐 Originele afbeelding: {width}x{height} pixels")
+            return width, height
+    except Exception as e:
+        logger.error(f"❌ Kan afbeelding niet lezen: {str(e)}")
+        return None, None
+
+
+def create_video_background(job_id: str, input_path: str, output_path: str, duration: int, fps: int, keep_original_resolution: bool):
+    """
+    Background task voor video creatie
+    """
+    try:
+        logger.info("=" * 80)
+        logger.info(f"🎬 BACKGROUND JOB GESTART [ID: {job_id[:8]}]")
+        logger.info("=" * 80)
+        
+        update_job_status(job_id, JobStatus.PROCESSING, progress=0)
+        
+        # Detecteer resolutie
+        orig_width, orig_height = get_image_dimensions(input_path)
+        
+        if orig_width is None or orig_height is None:
+            update_job_status(job_id, JobStatus.FAILED, error="Kan afbeelding dimensies niet bepalen")
+            return
+        
+        if keep_original_resolution:
+            width, height = orig_width, orig_height
+            logger.info(f"✅ Gebruik ORIGINELE resolutie: {width}x{height}")
+        else:
+            width, height = 1920, 1080
+            logger.info(f"⚠️  Gebruik standaard resolutie: {width}x{height}")
+        
+        update_job_status(job_id, JobStatus.PROCESSING, progress=5, width=width, height=height)
+        
+        estimated_frames = duration * fps
+        estimated_size_mb = (width * height * 3 * estimated_frames) / (1024 * 1024 * 20)
+        
+        logger.info(f"📊 PARAMETERS:")
+        logger.info(f"   ⏱️  Duur: {duration}s ({duration/60:.2f} min)")
+        logger.info(f"   🎞️  FPS: {fps}")
+        logger.info(f"   📐 Resolutie: {width}x{height}")
+        logger.info(f"   🖼️  Frames: {estimated_frames:,}")
+        logger.info(f"   📦 Geschat: ~{estimated_size_mb:.1f} MB")
+        logger.info("-" * 80)
+        
+        start_time = datetime.now()
+        
+        # FFmpeg command
+        cmd = [
+            'ffmpeg',
+            '-loop', '1',
+            '-i', input_path,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '18',
+            '-t', str(duration),
+            '-pix_fmt', 'yuv420p',
+            '-r', str(fps),
+            '-vf', f'scale={width}:{height}',
+            '-movflags', '+faststart',
+            '-y',
+            output_path
+        ]
+        
+        logger.info(f"🔧 FFmpeg: {' '.join(cmd[:8])}...")
+        
+        # Run FFmpeg
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        
+        # Monitor progress
+        last_update = datetime.now()
+        frame_count = 0
+        
+        for line in process.stderr:
+            if 'frame=' in line:
+                try:
+                    frame_str = line.split('frame=')[1].split()[0]
+                    frame_count = int(frame_str)
+                    
+                    # Update status elke 5 seconden
+                    if (datetime.now() - last_update).total_seconds() >= 5:
+                        progress = min(5 + (frame_count / estimated_frames) * 90, 95)
+                        elapsed = (datetime.now() - start_time).total_seconds()
+                        fps_actual = frame_count / elapsed if elapsed > 0 else 0
+                        
+                        update_job_status(
+                            job_id, 
+                            JobStatus.PROCESSING, 
+                            progress=int(progress),
+                            frames_processed=frame_count,
+                            total_frames=estimated_frames,
+                            fps_actual=round(fps_actual, 1)
+                        )
+                        
+                        logger.info(f"📊 Progress: {progress:.1f}% | Frame: {frame_count:,}/{estimated_frames:,} | FPS: {fps_actual:.1f}")
+                        last_update = datetime.now()
+                except:
+                    pass
+        
+        process.wait()
+        
+        if process.returncode != 0:
+            logger.error(f"❌ FFmpeg gefaald voor job {job_id[:8]}")
+            update_job_status(job_id, JobStatus.FAILED, error="FFmpeg processing failed", progress=0)
+            return
+        
+        # Check output
+        if not os.path.exists(output_path):
+            logger.error(f"❌ Output niet aangemaakt voor job {job_id[:8]}")
+            update_job_status(job_id, JobStatus.FAILED, error="Output file not created", progress=0)
+            return
+        
+        # Success!
+        end_time = datetime.now()
+        processing_time = (end_time - start_time).total_seconds()
+        output_size = os.path.getsize(output_path)
+        
+        logger.info("=" * 80)
+        logger.info(f"✅ JOB VOLTOOID [ID: {job_id[:8]}]")
+        logger.info("=" * 80)
+        logger.info(f"   ⏱️  Tijd: {processing_time:.2f}s")
+        logger.info(f"   📦 Grootte: {output_size / 1024 / 1024:.2f} MB")
+        logger.info(f"   ⚡ Snelheid: {duration / processing_time:.2f}x realtime")
+        logger.info("=" * 80)
+        
+        update_job_status(
+            job_id,
+            JobStatus.COMPLETED,
+            progress=100,
+            output_file=str(output_path),
+            processing_time=round(processing_time, 2),
+            file_size_mb=round(output_size / 1024 / 1024, 2),
+            frames_processed=frame_count,
+            download_url=f"/download/{job_id}"
+        )
+        
+        # Cleanup input
+        if os.path.exists(input_path):
+            os.remove(input_path)
+            logger.info(f"🧹 Input cleaned up")
+        
+    except Exception as e:
+        logger.error(f"❌ Error in background job {job_id[:8]}: {str(e)}")
+        update_job_status(job_id, JobStatus.FAILED, error=str(e), progress=0)
 
 
 @app.get("/")
 @app.head("/")
 async def root():
+    logger.info("📍 Root endpoint")
     return {
-        "message": "Foto Verlenger API - Maak een video van je foto",
-        "endpoints": {
-            "/extend": "POST - Upload foto en kies duur voor video"
+        "message": "🎬 Foto Verlenger API - Async 4K",
+        "status": "🟢 Online",
+        "version": "4.0 - Async",
+        "workflow": {
+            "step_1": "POST /extend → Krijg job_id direct terug",
+            "step_2": "GET /job/{job_id} → Check status (polling)",
+            "step_3": "GET /download/{job_id} → Download video wanneer klaar"
         },
-        "parameters": {
-            "file": "Afbeelding bestand (JPG, PNG, etc.)",
-            "duration": "Duur in seconden (standaard: 5, max: 1800 = 30 minuten)",
-            "fps": "Frames per seconde (standaard: 30)",
-            "width": "Video breedte in pixels (standaard: 1920)",
-            "height": "Video hoogte in pixels (standaard: 1080)"
-        }
+        "endpoints": {
+            "/extend": "POST - Start video job (async, geen timeout!)",
+            "/job/{job_id}": "GET - Check job status + progress",
+            "/download/{job_id}": "GET - Download completed video",
+            "/health": "GET - Health check",
+            "/stats": "GET - Server stats"
+        },
+        "features": [
+            "✅ Async processing - Geen timeouts in n8n!",
+            "✅ 4K support (originele resolutie)",
+            "✅ Real-time progress updates",
+            "✅ Video's tot 30 minuten",
+            "✅ CRF 18 quality"
+        ]
     }
 
 
 @app.post("/extend")
-async def extend_photo(
+async def extend_photo_async(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     duration: int = Form(default=5),
     fps: int = Form(default=30),
-    width: int = Form(default=1920),
-    height: int = Form(default=1080)
+    keep_original_resolution: bool = Form(default=True)
 ):
     """
-    Upload een foto en krijg een video terug van de gekozen duur
-    
-    Parameters:
-    - file: De foto die je wilt verlengen
-    - duration: Duur van de video in seconden (standaard: 5, max: 1800 = 30 minuten)
-    - fps: Frames per seconde (standaard: 30)
-    - width: Video breedte (standaard: 1920)
-    - height: Video hoogte (standaard: 1080)
+    Start een async video job - returnt DIRECT met job_id
+    Perfect voor n8n - geen timeouts!
     """
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="Alleen afbeeldingen zijn toegestaan")
+    job_id = str(uuid.uuid4())
+    
+    logger.info("=" * 80)
+    logger.info(f"📥 NIEUWE ASYNC REQUEST [Job ID: {job_id[:8]}]")
+    logger.info("=" * 80)
+    logger.info(f"📎 File: {file.filename}")
+    logger.info(f"📋 Type: {file.content_type}")
+    logger.info(f"⏱️  Duur: {duration}s")
+    logger.info(f"🎞️  FPS: {fps}")
+    logger.info(f"📐 Keep original: {keep_original_resolution}")
     
     # Validatie
+    if not file.content_type or not file.content_type.startswith('image/'):
+        raise HTTPException(status_code=400, detail="Alleen afbeeldingen toegestaan")
+    
     if duration < 1 or duration > 1800:
-        raise HTTPException(status_code=400, detail="Duur moet tussen 1 en 1800 seconden (30 minuten) zijn")
+        raise HTTPException(status_code=400, detail="Duur moet tussen 1-1800 seconden zijn")
     
     if fps < 1 or fps > 60:
-        raise HTTPException(status_code=400, detail="FPS moet tussen 1 en 60 zijn")
+        raise HTTPException(status_code=400, detail="FPS moet tussen 1-60 zijn")
     
-    # Unieke bestandsnamen genereren
+    # Bestandsnamen
     file_id = str(uuid.uuid4())
     input_filename = f"{file_id}_{file.filename}"
     output_filename = f"{file_id}_video_{duration}s.mp4"
     
-    input_path = UPLOAD_DIR / input_filename
-    output_path = OUTPUT_DIR / output_filename
+    input_path = str(UPLOAD_DIR / input_filename)
+    output_path = str(OUTPUT_DIR / output_filename)
     
     try:
-        # Bestand opslaan
+        # Save file
+        logger.info("💾 Bestand opslaan...")
+        file_content = await file.read()
+        file_size_mb = len(file_content) / 1024 / 1024
+        logger.info(f"📦 Grootte: {file_size_mb:.2f} MB")
+        
         with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            buffer.write(file_content)
         
-        # Video creëren
-        create_video_from_image(str(input_path), str(output_path), duration, fps, width, height)
-        
-        # Input bestand verwijderen
-        input_path.unlink()
-        
-        return FileResponse(
-            output_path,
-            media_type="video/mp4",
-            filename=output_filename,
-            background=None
+        # Create job
+        update_job_status(
+            job_id,
+            JobStatus.PENDING,
+            filename=file.filename,
+            duration=duration,
+            fps=fps,
+            keep_original_resolution=keep_original_resolution,
+            input_size_mb=round(file_size_mb, 2),
+            progress=0
         )
-    
+        
+        # Start background task
+        background_tasks.add_task(
+            create_video_background,
+            job_id,
+            input_path,
+            output_path,
+            duration,
+            fps,
+            keep_original_resolution
+        )
+        
+        logger.info(f"✅ Job gestart in background")
+        logger.info(f"🔗 Status URL: /job/{job_id}")
+        logger.info(f"🔗 Download URL: /download/{job_id}")
+        logger.info("=" * 80)
+        
+        # Return immediate response
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "accepted",
+                "message": "Video wordt gemaakt in de achtergrond",
+                "job_id": job_id,
+                "status_url": f"/job/{job_id}",
+                "download_url": f"/download/{job_id}",
+                "estimated_time_seconds": max(duration / 60, 5),
+                "poll_interval_seconds": 3
+            }
+        )
+        
     except Exception as e:
-        # Cleanup bij fout
-        if input_path.exists():
-            input_path.unlink()
-        if output_path.exists():
-            output_path.unlink()
+        logger.error(f"❌ Error bij job start: {str(e)}")
+        if os.path.exists(input_path):
+            os.remove(input_path)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/job/{job_id}")
+async def get_job_status(job_id: str):
+    """
+    Check job status - gebruik dit voor polling in n8n
+    """
+    logger.info(f"🔍 Status check voor job {job_id[:8]}")
+    
+    job_info = get_job_info(job_id)
+    
+    if not job_info:
+        logger.warning(f"❌ Job {job_id[:8]} niet gevonden")
+        raise HTTPException(status_code=404, detail="Job niet gevonden")
+    
+    logger.info(f"📊 Job {job_id[:8]} status: {job_info.get('status')} - {job_info.get('progress', 0)}%")
+    
+    return job_info
+
+
+@app.get("/download/{job_id}")
+async def download_video(job_id: str):
+    """
+    Download de completed video
+    """
+    logger.info(f"⬇️  Download request voor job {job_id[:8]}")
+    
+    job_info = get_job_info(job_id)
+    
+    if not job_info:
+        raise HTTPException(status_code=404, detail="Job niet gevonden")
+    
+    if job_info["status"] != JobStatus.COMPLETED:
+        status = job_info["status"]
+        progress = job_info.get("progress", 0)
+        
+        if status == JobStatus.FAILED:
+            error = job_info.get("error", "Unknown error")
+            raise HTTPException(status_code=500, detail=f"Job failed: {error}")
+        else:
+            raise HTTPException(
+                status_code=425,
+                detail=f"Video nog niet klaar. Status: {status}, Progress: {progress}%"
+            )
+    
+    output_file = job_info.get("output_file")
+    
+    if not output_file or not os.path.exists(output_file):
+        raise HTTPException(status_code=404, detail="Video bestand niet gevonden")
+    
+    logger.info(f"✅ Downloading job {job_id[:8]}")
+    
+    return FileResponse(
+        output_file,
+        media_type="video/mp4",
+        filename=f"video_{job_id[:8]}.mp4",
+        headers={
+            "X-Job-ID": job_id,
+            "X-Processing-Time": str(job_info.get("processing_time", 0))
+        }
+    )
 
 
 @app.get("/health")
 @app.head("/health")
 async def health_check():
-    """Health check endpoint voor Render"""
-    # Check of FFmpeg beschikbaar is
+    """Health check"""
     try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        ffmpeg_status = "available"
-    except:
-        ffmpeg_status = "not available"
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, text=True, timeout=5)
+        ffmpeg_version = result.stdout.split('\n')[0]
+        ffmpeg_status = "✅ Available"
+    except Exception as e:
+        ffmpeg_status = "❌ Not available"
+        ffmpeg_version = str(e)
+    
+    # Count jobs
+    total_jobs = len(list(JOBS_DIR.glob("*.json")))
+    pending = 0
+    processing = 0
+    completed = 0
+    failed = 0
+    
+    for job_file in JOBS_DIR.glob("*.json"):
+        try:
+            with open(job_file) as f:
+                job = json.load(f)
+                status = job.get("status")
+                if status == "pending":
+                    pending += 1
+                elif status == "processing":
+                    processing += 1
+                elif status == "completed":
+                    completed += 1
+                elif status == "failed":
+                    failed += 1
+        except:
+            pass
     
     return {
-        "status": "healthy",
-        "ffmpeg": ffmpeg_status
+        "status": "🟢 Healthy",
+        "ffmpeg": {
+            "status": ffmpeg_status,
+            "version": ffmpeg_version
+        },
+        "jobs": {
+            "total": total_jobs,
+            "pending": pending,
+            "processing": processing,
+            "completed": completed,
+            "failed": failed
+        }
+    }
+
+
+@app.get("/stats")
+async def stats():
+    """Server statistieken"""
+    upload_files = list(UPLOAD_DIR.glob("*"))
+    output_files = list(OUTPUT_DIR.glob("*"))
+    job_files = list(JOBS_DIR.glob("*.json"))
+    
+    return {
+        "upload_dir": {
+            "files": len(upload_files),
+            "total_size_mb": round(sum(f.stat().st_size for f in upload_files) / 1024 / 1024, 2)
+        },
+        "output_dir": {
+            "files": len(output_files),
+            "total_size_mb": round(sum(f.stat().st_size for f in output_files) / 1024 / 1024, 2)
+        },
+        "jobs": {
+            "total": len(job_files)
+        }
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    logger.info("🚀 Starting Async Foto Verlenger API...")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        log_level="info"
+    )
