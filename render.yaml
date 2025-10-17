@@ -3,3 +3,5 @@ services:
     name: foto-verlenger
     runtime: docker
     dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    plan: pro
