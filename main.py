@@ -13,6 +13,8 @@ from PIL import Image
 import json
 from enum import Enum
 from typing import Optional
+import httpx  # ← NIEUWE IMPORT VOOR URL DOWNLOADS
+from urllib.parse import urlparse
 
 # Logging configuratie
 logging.basicConfig(
@@ -104,6 +106,49 @@ def get_image_dimensions(image_path: str):
     except Exception as e:
         logger.error(f"❌ Kan afbeelding niet lezen: {str(e)}")
         return None, None
+
+
+async def download_image_from_url(url: str, save_path: str) -> tuple[bool, str, float]:
+    """
+    Download afbeelding van URL
+    Returns: (success, error_message, file_size_mb)
+    """
+    try:
+        logger.info(f"🌐 Downloading image from URL: {url[:60]}...")
+        
+        # Validate URL
+        parsed = urlparse(url)
+        if not parsed.scheme in ['http', 'https']:
+            return False, "Invalid URL scheme (must be http or https)", 0
+        
+        # Download with httpx
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, follow_redirects=True)
+            
+            if response.status_code != 200:
+                return False, f"HTTP {response.status_code}: {response.reason_phrase}", 0
+            
+            # Check content type
+            content_type = response.headers.get('content-type', '')
+            if not content_type.startswith('image/'):
+                return False, f"URL does not point to an image (Content-Type: {content_type})", 0
+            
+            # Save file
+            file_content = response.content
+            file_size_mb = len(file_content) / 1024 / 1024
+            
+            with open(save_path, 'wb') as f:
+                f.write(file_content)
+            
+            logger.info(f"✅ Downloaded {file_size_mb:.2f} MB from URL")
+            return True, "", file_size_mb
+            
+    except httpx.TimeoutException:
+        return False, "Download timeout (30s exceeded)", 0
+    except httpx.RequestError as e:
+        return False, f"Download failed: {str(e)}", 0
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", 0
 
 
 def create_video_background(job_id: str, input_path: str, output_path: str, duration: int, fps: int, keep_original_resolution: bool):
@@ -257,25 +302,30 @@ async def root():
     return {
         "message": "🎬 Foto Verlenger API - Async 4K",
         "status": "🟢 Online",
-        "version": "4.0 - Async",
+        "version": "4.1 - Async + URL Support",
         "workflow": {
-            "step_1": "POST /extend → Krijg job_id direct terug",
+            "step_1": "POST /extend → Krijg job_id direct terug (upload OF url)",
             "step_2": "GET /job/{job_id} → Check status (polling)",
             "step_3": "GET /download/{job_id} → Download video wanneer klaar"
         },
         "endpoints": {
-            "/extend": "POST - Start video job (async, geen timeout!)",
+            "/extend": "POST - Start video job (file upload OF image_url)",
             "/job/{job_id}": "GET - Check job status + progress",
             "/download/{job_id}": "GET - Download completed video",
             "/health": "GET - Health check",
             "/stats": "GET - Server stats"
+        },
+        "input_methods": {
+            "file_upload": "Stuur 'file' parameter met image bestand",
+            "url": "Stuur 'image_url' parameter met image URL"
         },
         "features": [
             "✅ Async processing - Geen timeouts in n8n!",
             "✅ 4K support (originele resolutie)",
             "✅ Real-time progress updates",
             "✅ Video's tot 30 minuten",
-            "✅ CRF 18 quality"
+            "✅ CRF 18 quality",
+            "✅ URL support - Download from any image URL"
         ]
     }
 
@@ -283,13 +333,19 @@ async def root():
 @app.post("/extend")
 async def extend_photo_async(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    image_url: Optional[str] = Form(None),
     duration: int = Form(default=5),
     fps: int = Form(default=30),
     keep_original_resolution: bool = Form(default=True)
 ):
     """
     Start een async video job - returnt DIRECT met job_id
+    
+    Ondersteunt 2 input methodes:
+    1. FILE UPLOAD: Stuur 'file' parameter met afbeelding
+    2. IMAGE URL: Stuur 'image_url' parameter met URL naar afbeelding
+    
     Perfect voor n8n - geen timeouts!
     """
     job_id = str(uuid.uuid4())
@@ -297,16 +353,21 @@ async def extend_photo_async(
     logger.info("=" * 80)
     logger.info(f"📥 NIEUWE ASYNC REQUEST [Job ID: {job_id[:8]}]")
     logger.info("=" * 80)
-    logger.info(f"📎 File: {file.filename}")
-    logger.info(f"📋 Type: {file.content_type}")
-    logger.info(f"⏱️  Duur: {duration}s")
-    logger.info(f"🎞️  FPS: {fps}")
-    logger.info(f"📐 Keep original: {keep_original_resolution}")
     
-    # Validatie
-    if not file.content_type or not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="Alleen afbeeldingen toegestaan")
+    # Validatie: moet file OF url hebben
+    if not file and not image_url:
+        raise HTTPException(
+            status_code=400, 
+            detail="Geef een 'file' (upload) OF 'image_url' (URL) parameter"
+        )
     
+    if file and image_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Gebruik alleen 'file' OF 'image_url', niet beide"
+        )
+    
+    # Validatie parameters
     if duration < 1 or duration > 1800:
         raise HTTPException(status_code=400, detail="Duur moet tussen 1-1800 seconden zijn")
     
@@ -315,27 +376,64 @@ async def extend_photo_async(
     
     # Bestandsnamen
     file_id = str(uuid.uuid4())
-    input_filename = f"{file_id}_{file.filename}"
+    
+    if file:
+        input_filename = f"{file_id}_{file.filename}"
+        source_type = "upload"
+        source_name = file.filename
+    else:
+        # Haal extensie van URL of gebruik .jpg als fallback
+        parsed_url = urlparse(image_url)
+        url_path = parsed_url.path
+        ext = os.path.splitext(url_path)[1] or '.jpg'
+        input_filename = f"{file_id}_from_url{ext}"
+        source_type = "url"
+        source_name = image_url[:60] + "..." if len(image_url) > 60 else image_url
+    
     output_filename = f"{file_id}_video_{duration}s.mp4"
     
     input_path = str(UPLOAD_DIR / input_filename)
     output_path = str(OUTPUT_DIR / output_filename)
     
+    logger.info(f"📋 Source type: {source_type}")
+    logger.info(f"📎 Source: {source_name}")
+    logger.info(f"⏱️  Duur: {duration}s")
+    logger.info(f"🎞️  FPS: {fps}")
+    logger.info(f"📐 Keep original: {keep_original_resolution}")
+    
     try:
-        # Save file
-        logger.info("💾 Bestand opslaan...")
-        file_content = await file.read()
-        file_size_mb = len(file_content) / 1024 / 1024
-        logger.info(f"📦 Grootte: {file_size_mb:.2f} MB")
+        file_size_mb = 0
         
-        with open(input_path, "wb") as buffer:
-            buffer.write(file_content)
+        # OPTIE 1: File upload
+        if file:
+            # Valideer content type
+            if not file.content_type or not file.content_type.startswith('image/'):
+                raise HTTPException(status_code=400, detail="Alleen afbeeldingen toegestaan")
+            
+            logger.info("💾 Bestand uploaden...")
+            file_content = await file.read()
+            file_size_mb = len(file_content) / 1024 / 1024
+            logger.info(f"📦 Grootte: {file_size_mb:.2f} MB")
+            
+            with open(input_path, "wb") as buffer:
+                buffer.write(file_content)
+        
+        # OPTIE 2: Download van URL
+        else:
+            logger.info("🌐 Afbeelding downloaden van URL...")
+            success, error_msg, file_size_mb = await download_image_from_url(image_url, input_path)
+            
+            if not success:
+                raise HTTPException(status_code=400, detail=f"Download failed: {error_msg}")
+            
+            logger.info(f"✅ Downloaded: {file_size_mb:.2f} MB")
         
         # Create job
         update_job_status(
             job_id,
             JobStatus.PENDING,
-            filename=file.filename,
+            source_type=source_type,
+            source=source_name,
             duration=duration,
             fps=fps,
             keep_original_resolution=keep_original_resolution,
@@ -366,6 +464,7 @@ async def extend_photo_async(
                 "status": "accepted",
                 "message": "Video wordt gemaakt in de achtergrond",
                 "job_id": job_id,
+                "source_type": source_type,
                 "status_url": f"/job/{job_id}",
                 "download_url": f"/download/{job_id}",
                 "estimated_time_seconds": max(duration / 60, 5),
@@ -373,6 +472,11 @@ async def extend_photo_async(
             }
         )
         
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        raise
     except Exception as e:
         logger.error(f"❌ Error bij job start: {str(e)}")
         if os.path.exists(input_path):
@@ -478,6 +582,7 @@ async def health_check():
     
     return {
         "status": "🟢 Healthy",
+        "version": "4.1 - URL Support",
         "ffmpeg": {
             "status": ffmpeg_status,
             "version": ffmpeg_version
@@ -516,7 +621,7 @@ async def stats():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting Async Foto Verlenger API...")
+    logger.info("🚀 Starting Async Foto Verlenger API with URL support...")
     uvicorn.run(
         app,
         host="0.0.0.0",
