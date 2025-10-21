@@ -1,6 +1,7 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import subprocess
 import os
 import uuid
@@ -8,13 +9,15 @@ from pathlib import Path
 import tempfile
 import shutil
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from PIL import Image
 import json
 from enum import Enum
 from typing import Optional
-import httpx  # ← NIEUWE IMPORT VOOR URL DOWNLOADS
+import httpx
 from urllib.parse import urlparse
+import threading
+import time
 
 # Logging configuratie
 logging.basicConfig(
@@ -26,33 +29,80 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Foto Verlenger API - Async 4K")
+app = FastAPI(title="Foto Verlenger API - Video URL Output")
 
-# CORS middleware
+# CORS middleware - BELANGRIJK voor fal.ai en cross-origin requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
-# Directories
-UPLOAD_DIR = Path(tempfile.gettempdir()) / "uploads"
-OUTPUT_DIR = Path(tempfile.gettempdir()) / "outputs"
-JOBS_DIR = Path(tempfile.gettempdir()) / "jobs"
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-JOBS_DIR.mkdir(exist_ok=True)
+# Directories - Gebruik /data voor persistent storage op Render
+if os.path.exists('/data'):
+    # Render persistent disk
+    UPLOAD_DIR = Path('/data') / "uploads"
+    OUTPUT_DIR = Path('/data') / "outputs"
+    JOBS_DIR = Path('/data') / "jobs"
+    logger.info("🗄️  Using Render persistent disk: /data")
+else:
+    # Fallback naar temp (local development)
+    UPLOAD_DIR = Path(tempfile.gettempdir()) / "uploads"
+    OUTPUT_DIR = Path(tempfile.gettempdir()) / "outputs"
+    JOBS_DIR = Path(tempfile.gettempdir()) / "jobs"
+    logger.info("⚠️  Using temporary storage (ephemeral)")
+
+UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
+OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+JOBS_DIR.mkdir(exist_ok=True, parents=True)
+
+# Mount static files voor directe video toegang
+app.mount("/videos", StaticFiles(directory=str(OUTPUT_DIR)), name="videos")
 
 logger.info("=" * 80)
-logger.info("🚀 FOTO VERLENGER API - ASYNC 4K - GESTART")
+logger.info("🚀 FOTO VERLENGER API - VIDEO URL OUTPUT - GESTART")
 logger.info("=" * 80)
 logger.info(f"📁 Upload directory: {UPLOAD_DIR}")
 logger.info(f"📁 Output directory: {OUTPUT_DIR}")
 logger.info(f"📁 Jobs directory: {JOBS_DIR}")
-logger.info(f"💰 Render Plan: Pro ($25/maand)")
+logger.info(f"🌐 Video serving: /videos (static files)")
 logger.info("=" * 80)
+
+
+# Cleanup thread voor oude bestanden (6 uur)
+def cleanup_old_files():
+    """Verwijdert video's ouder dan 6 uur"""
+    while True:
+        try:
+            time.sleep(300)  # Check elke 5 minuten
+            now = datetime.now()
+            cutoff = now - timedelta(hours=6)
+            
+            deleted_count = 0
+            for video_file in OUTPUT_DIR.glob("*.mp4"):
+                file_time = datetime.fromtimestamp(video_file.stat().st_mtime)
+                if file_time < cutoff:
+                    video_file.unlink()
+                    deleted_count += 1
+                    
+                    # Verwijder ook job info
+                    job_id = video_file.stem.split('_')[0]
+                    job_file = JOBS_DIR / f"{job_id}.json"
+                    if job_file.exists():
+                        job_file.unlink()
+            
+            if deleted_count > 0:
+                logger.info(f"🧹 Cleaned up {deleted_count} videos older than 6 hours")
+                
+        except Exception as e:
+            logger.error(f"❌ Cleanup error: {e}")
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
+cleanup_thread.start()
 
 
 class JobStatus(str, Enum):
@@ -116,24 +166,20 @@ async def download_image_from_url(url: str, save_path: str) -> tuple[bool, str, 
     try:
         logger.info(f"🌐 Downloading image from URL: {url[:60]}...")
         
-        # Validate URL
         parsed = urlparse(url)
         if not parsed.scheme in ['http', 'https']:
             return False, "Invalid URL scheme (must be http or https)", 0
         
-        # Download with httpx
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url, follow_redirects=True)
             
             if response.status_code != 200:
                 return False, f"HTTP {response.status_code}: {response.reason_phrase}", 0
             
-            # Check content type
             content_type = response.headers.get('content-type', '')
             if not content_type.startswith('image/'):
                 return False, f"URL does not point to an image (Content-Type: {content_type})", 0
             
-            # Save file
             file_content = response.content
             file_size_mb = len(file_content) / 1024 / 1024
             
@@ -151,10 +197,12 @@ async def download_image_from_url(url: str, save_path: str) -> tuple[bool, str, 
         return False, f"Unexpected error: {str(e)}", 0
 
 
-def create_video_background(job_id: str, input_path: str, output_path: str, duration: int, fps: int, keep_original_resolution: bool):
+def create_video_background(job_id: str, input_path: str, output_filename: str, duration: int, fps: int, keep_original_resolution: bool, base_url: str):
     """
     Background task voor video creatie
     """
+    output_path = str(OUTPUT_DIR / output_filename)
+    
     try:
         logger.info("=" * 80)
         logger.info(f"🎬 BACKGROUND JOB GESTART [ID: {job_id[:8]}]")
@@ -162,7 +210,6 @@ def create_video_background(job_id: str, input_path: str, output_path: str, dura
         
         update_job_status(job_id, JobStatus.PROCESSING, progress=0)
         
-        # Detecteer resolutie
         orig_width, orig_height = get_image_dimensions(input_path)
         
         if orig_width is None or orig_height is None:
@@ -191,7 +238,6 @@ def create_video_background(job_id: str, input_path: str, output_path: str, dura
         
         start_time = datetime.now()
         
-        # FFmpeg command
         cmd = [
             'ffmpeg',
             '-loop', '1',
@@ -210,7 +256,6 @@ def create_video_background(job_id: str, input_path: str, output_path: str, dura
         
         logger.info(f"🔧 FFmpeg: {' '.join(cmd[:8])}...")
         
-        # Run FFmpeg
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -218,7 +263,6 @@ def create_video_background(job_id: str, input_path: str, output_path: str, dura
             universal_newlines=True
         )
         
-        # Monitor progress
         last_update = datetime.now()
         frame_count = 0
         
@@ -228,7 +272,6 @@ def create_video_background(job_id: str, input_path: str, output_path: str, dura
                     frame_str = line.split('frame=')[1].split()[0]
                     frame_count = int(frame_str)
                     
-                    # Update status elke 5 seconden
                     if (datetime.now() - last_update).total_seconds() >= 5:
                         progress = min(5 + (frame_count / estimated_frames) * 90, 95)
                         elapsed = (datetime.now() - start_time).total_seconds()
@@ -255,16 +298,18 @@ def create_video_background(job_id: str, input_path: str, output_path: str, dura
             update_job_status(job_id, JobStatus.FAILED, error="FFmpeg processing failed", progress=0)
             return
         
-        # Check output
         if not os.path.exists(output_path):
             logger.error(f"❌ Output niet aangemaakt voor job {job_id[:8]}")
             update_job_status(job_id, JobStatus.FAILED, error="Output file not created", progress=0)
             return
         
-        # Success!
         end_time = datetime.now()
         processing_time = (end_time - start_time).total_seconds()
         output_size = os.path.getsize(output_path)
+        expires_at = end_time + timedelta(hours=16)
+        
+        # BELANGRIJKSTE: Video URL genereren
+        video_url = f"{base_url}/videos/{output_filename}"
         
         logger.info("=" * 80)
         logger.info(f"✅ JOB VOLTOOID [ID: {job_id[:8]}]")
@@ -272,6 +317,8 @@ def create_video_background(job_id: str, input_path: str, output_path: str, dura
         logger.info(f"   ⏱️  Tijd: {processing_time:.2f}s")
         logger.info(f"   📦 Grootte: {output_size / 1024 / 1024:.2f} MB")
         logger.info(f"   ⚡ Snelheid: {duration / processing_time:.2f}x realtime")
+        logger.info(f"   🔗 Video URL: {video_url}")
+        logger.info(f"   ⏰ Expires: {expires_at.isoformat()}")
         logger.info("=" * 80)
         
         update_job_status(
@@ -279,10 +326,17 @@ def create_video_background(job_id: str, input_path: str, output_path: str, dura
             JobStatus.COMPLETED,
             progress=100,
             output_file=str(output_path),
+            output_filename=output_filename,
             processing_time=round(processing_time, 2),
             file_size_mb=round(output_size / 1024 / 1024, 2),
             frames_processed=frame_count,
-            download_url=f"/download/{job_id}"
+            width=width,
+            height=height,
+            duration=duration,
+            fps=fps,
+            video_url=video_url,
+            expires_at=expires_at.isoformat(),
+            expires_in_hours=16
         )
         
         # Cleanup input
@@ -300,38 +354,35 @@ def create_video_background(job_id: str, input_path: str, output_path: str, dura
 async def root():
     logger.info("📍 Root endpoint")
     return {
-        "message": "🎬 Foto Verlenger API - Async 4K",
+        "message": "🎬 Foto Verlenger API - Direct Video URL",
         "status": "🟢 Online",
-        "version": "4.1 - Async + URL Support",
+        "version": "5.0 - Direct Video URL for fal.ai",
         "workflow": {
-            "step_1": "POST /extend → Krijg job_id direct terug (upload OF url)",
-            "step_2": "GET /job/{job_id} → Check status (polling)",
-            "step_3": "GET /download/{job_id} → Download video wanneer klaar"
+            "step_1": "POST /extend → Krijg job_id (upload OF url)",
+            "step_2": "GET /job/{job_id} → Check status + krijg video_url",
+            "step_3": "Gebruik video_url direct in fal.ai!"
         },
         "endpoints": {
-            "/extend": "POST - Start video job (file upload OF image_url)",
-            "/job/{job_id}": "GET - Check job status + progress",
-            "/download/{job_id}": "GET - Download completed video",
-            "/health": "GET - Health check",
-            "/stats": "GET - Server stats"
-        },
-        "input_methods": {
-            "file_upload": "Stuur 'file' parameter met image bestand",
-            "url": "Stuur 'image_url' parameter met image URL"
+            "/extend": "POST - Start video job",
+            "/job/{job_id}": "GET - Status + video_url",
+            "/videos/{filename}": "GET - Direct video URL (voor fal.ai)",
+            "/health": "GET - Health check"
         },
         "features": [
-            "✅ Async processing - Geen timeouts in n8n!",
-            "✅ 4K support (originele resolutie)",
-            "✅ Real-time progress updates",
-            "✅ Video's tot 30 minuten",
-            "✅ CRF 18 quality",
-            "✅ URL support - Download from any image URL"
+            "✅ Direct video URL - Perfect voor fal.ai!",
+            "✅ Geen downloads nodig in n8n",
+            "✅ 16 uur video beschikbaarheid",
+            "✅ Persistent storage (Render Disk)",
+            "✅ CORS enabled",
+            "✅ 4K support",
+            "✅ Tot 60 minuten video"
         ]
     }
 
 
 @app.post("/extend")
 async def extend_photo_async(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: Optional[UploadFile] = File(None),
     image_url: Optional[str] = Form(None),
@@ -340,13 +391,8 @@ async def extend_photo_async(
     keep_original_resolution: bool = Form(default=True)
 ):
     """
-    Start een async video job - returnt DIRECT met job_id
-    
-    Ondersteunt 2 input methodes:
-    1. FILE UPLOAD: Stuur 'file' parameter met afbeelding
-    2. IMAGE URL: Stuur 'image_url' parameter met URL naar afbeelding
-    
-    Perfect voor n8n - geen timeouts!
+    Start async video job
+    Returnt job_id → Poll /job/{job_id} → Krijg video_url voor fal.ai
     """
     job_id = str(uuid.uuid4())
     
@@ -354,7 +400,6 @@ async def extend_photo_async(
     logger.info(f"📥 NIEUWE ASYNC REQUEST [Job ID: {job_id[:8]}]")
     logger.info("=" * 80)
     
-    # Validatie: moet file OF url hebben
     if not file and not image_url:
         raise HTTPException(
             status_code=400, 
@@ -367,12 +412,14 @@ async def extend_photo_async(
             detail="Gebruik alleen 'file' OF 'image_url', niet beide"
         )
     
-    # Validatie parameters
-    if duration < 1 or duration > 1800:
-        raise HTTPException(status_code=400, detail="Duur moet tussen 1-1800 seconden zijn")
+    if duration < 1 or duration > 3600:
+        raise HTTPException(status_code=400, detail="Duur moet tussen 1-3600 seconden (60 minuten) zijn")
     
     if fps < 1 or fps > 60:
         raise HTTPException(status_code=400, detail="FPS moet tussen 1-60 zijn")
+    
+    # Get base URL from request
+    base_url = str(request.base_url).rstrip('/')
     
     # Bestandsnamen
     file_id = str(uuid.uuid4())
@@ -382,7 +429,6 @@ async def extend_photo_async(
         source_type = "upload"
         source_name = file.filename
     else:
-        # Haal extensie van URL of gebruik .jpg als fallback
         parsed_url = urlparse(image_url)
         url_path = parsed_url.path
         ext = os.path.splitext(url_path)[1] or '.jpg'
@@ -390,43 +436,32 @@ async def extend_photo_async(
         source_type = "url"
         source_name = image_url[:60] + "..." if len(image_url) > 60 else image_url
     
-    output_filename = f"{file_id}_video_{duration}s.mp4"
+    output_filename = f"{job_id}.mp4"  # Gebruik job_id als filename
     
     input_path = str(UPLOAD_DIR / input_filename)
-    output_path = str(OUTPUT_DIR / output_filename)
     
-    logger.info(f"📋 Source type: {source_type}")
-    logger.info(f"📎 Source: {source_name}")
-    logger.info(f"⏱️  Duur: {duration}s")
-    logger.info(f"🎞️  FPS: {fps}")
-    logger.info(f"📐 Keep original: {keep_original_resolution}")
+    logger.info(f"📋 Source: {source_type} - {source_name}")
+    logger.info(f"⏱️  Duur: {duration}s | FPS: {fps}")
     
     try:
         file_size_mb = 0
         
-        # OPTIE 1: File upload
         if file:
-            # Valideer content type
             if not file.content_type or not file.content_type.startswith('image/'):
                 raise HTTPException(status_code=400, detail="Alleen afbeeldingen toegestaan")
             
-            logger.info("💾 Bestand uploaden...")
+            logger.info("💾 Uploading...")
             file_content = await file.read()
             file_size_mb = len(file_content) / 1024 / 1024
-            logger.info(f"📦 Grootte: {file_size_mb:.2f} MB")
             
             with open(input_path, "wb") as buffer:
                 buffer.write(file_content)
-        
-        # OPTIE 2: Download van URL
         else:
-            logger.info("🌐 Afbeelding downloaden van URL...")
+            logger.info("🌐 Downloading...")
             success, error_msg, file_size_mb = await download_image_from_url(image_url, input_path)
             
             if not success:
                 raise HTTPException(status_code=400, detail=f"Download failed: {error_msg}")
-            
-            logger.info(f"✅ Downloaded: {file_size_mb:.2f} MB")
         
         # Create job
         update_job_status(
@@ -446,39 +481,36 @@ async def extend_photo_async(
             create_video_background,
             job_id,
             input_path,
-            output_path,
+            output_filename,
             duration,
             fps,
-            keep_original_resolution
+            keep_original_resolution,
+            base_url
         )
         
-        logger.info(f"✅ Job gestart in background")
-        logger.info(f"🔗 Status URL: /job/{job_id}")
-        logger.info(f"🔗 Download URL: /download/{job_id}")
+        logger.info(f"✅ Job started")
+        logger.info(f"🔗 Status: /job/{job_id}")
+        logger.info(f"🔗 Video URL: {base_url}/videos/{output_filename} (after completion)")
         logger.info("=" * 80)
         
-        # Return immediate response
         return JSONResponse(
             status_code=202,
             content={
                 "status": "accepted",
-                "message": "Video wordt gemaakt in de achtergrond",
+                "message": "Video wordt gemaakt - Poll /job/{job_id} voor video_url",
                 "job_id": job_id,
-                "source_type": source_type,
                 "status_url": f"/job/{job_id}",
-                "download_url": f"/download/{job_id}",
                 "estimated_time_seconds": max(duration / 60, 5),
-                "poll_interval_seconds": 3
+                "poll_interval_seconds": 5
             }
         )
         
     except HTTPException:
-        # Re-raise HTTP exceptions
         if os.path.exists(input_path):
             os.remove(input_path)
         raise
     except Exception as e:
-        logger.error(f"❌ Error bij job start: {str(e)}")
+        logger.error(f"❌ Error: {str(e)}")
         if os.path.exists(input_path):
             os.remove(input_path)
         raise HTTPException(status_code=500, detail=str(e))
@@ -487,62 +519,23 @@ async def extend_photo_async(
 @app.get("/job/{job_id}")
 async def get_job_status(job_id: str):
     """
-    Check job status - gebruik dit voor polling in n8n
+    Check job status
+    Wanneer completed: krijg video_url voor gebruik in fal.ai!
     """
-    logger.info(f"🔍 Status check voor job {job_id[:8]}")
+    logger.info(f"🔍 Status check: {job_id[:8]}")
     
     job_info = get_job_info(job_id)
     
     if not job_info:
-        logger.warning(f"❌ Job {job_id[:8]} niet gevonden")
         raise HTTPException(status_code=404, detail="Job niet gevonden")
     
-    logger.info(f"📊 Job {job_id[:8]} status: {job_info.get('status')} - {job_info.get('progress', 0)}%")
+    status = job_info.get('status')
+    progress = job_info.get('progress', 0)
     
+    logger.info(f"📊 Job {job_id[:8]}: {status} - {progress}%")
+    
+    # Return job info (inclusief video_url als completed)
     return job_info
-
-
-@app.get("/download/{job_id}")
-async def download_video(job_id: str):
-    """
-    Download de completed video
-    """
-    logger.info(f"⬇️  Download request voor job {job_id[:8]}")
-    
-    job_info = get_job_info(job_id)
-    
-    if not job_info:
-        raise HTTPException(status_code=404, detail="Job niet gevonden")
-    
-    if job_info["status"] != JobStatus.COMPLETED:
-        status = job_info["status"]
-        progress = job_info.get("progress", 0)
-        
-        if status == JobStatus.FAILED:
-            error = job_info.get("error", "Unknown error")
-            raise HTTPException(status_code=500, detail=f"Job failed: {error}")
-        else:
-            raise HTTPException(
-                status_code=425,
-                detail=f"Video nog niet klaar. Status: {status}, Progress: {progress}%"
-            )
-    
-    output_file = job_info.get("output_file")
-    
-    if not output_file or not os.path.exists(output_file):
-        raise HTTPException(status_code=404, detail="Video bestand niet gevonden")
-    
-    logger.info(f"✅ Downloading job {job_id[:8]}")
-    
-    return FileResponse(
-        output_file,
-        media_type="video/mp4",
-        filename=f"video_{job_id[:8]}.mp4",
-        headers={
-            "X-Job-ID": job_id,
-            "X-Processing-Time": str(job_info.get("processing_time", 0))
-        }
-    )
 
 
 @app.get("/health")
@@ -557,71 +550,28 @@ async def health_check():
         ffmpeg_status = "❌ Not available"
         ffmpeg_version = str(e)
     
-    # Count jobs
     total_jobs = len(list(JOBS_DIR.glob("*.json")))
-    pending = 0
-    processing = 0
-    completed = 0
-    failed = 0
-    
-    for job_file in JOBS_DIR.glob("*.json"):
-        try:
-            with open(job_file) as f:
-                job = json.load(f)
-                status = job.get("status")
-                if status == "pending":
-                    pending += 1
-                elif status == "processing":
-                    processing += 1
-                elif status == "completed":
-                    completed += 1
-                elif status == "failed":
-                    failed += 1
-        except:
-            pass
+    total_videos = len(list(OUTPUT_DIR.glob("*.mp4")))
     
     return {
         "status": "🟢 Healthy",
-        "version": "4.1 - URL Support",
+        "version": "5.0 - Direct Video URL",
         "ffmpeg": {
             "status": ffmpeg_status,
             "version": ffmpeg_version
         },
-        "jobs": {
-            "total": total_jobs,
-            "pending": pending,
-            "processing": processing,
-            "completed": completed,
-            "failed": failed
-        }
-    }
-
-
-@app.get("/stats")
-async def stats():
-    """Server statistieken"""
-    upload_files = list(UPLOAD_DIR.glob("*"))
-    output_files = list(OUTPUT_DIR.glob("*"))
-    job_files = list(JOBS_DIR.glob("*.json"))
-    
-    return {
-        "upload_dir": {
-            "files": len(upload_files),
-            "total_size_mb": round(sum(f.stat().st_size for f in upload_files) / 1024 / 1024, 2)
-        },
-        "output_dir": {
-            "files": len(output_files),
-            "total_size_mb": round(sum(f.stat().st_size for f in output_files) / 1024 / 1024, 2)
-        },
-        "jobs": {
-            "total": len(job_files)
+        "storage": {
+            "total_jobs": total_jobs,
+            "total_videos": total_videos,
+            "cleanup_interval": "16 hours",
+            "storage_type": "persistent" if os.path.exists('/data') else "ephemeral"
         }
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting Async Foto Verlenger API with URL support...")
+    logger.info("🚀 Starting API with direct video URL support...")
     uvicorn.run(
         app,
         host="0.0.0.0",
